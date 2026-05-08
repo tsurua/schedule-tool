@@ -101,21 +101,31 @@ def build_extraction_prompt(event):
 2. 予定の中身（タイトル・内容・人名）は絶対に出力しない(プライバシー保護)
 3. 候補期間外の日付は無視
 4. 空きがある日付だけを出力
+5. visible_range には「画像で実際に視認できた日付範囲」を入れる（日付が読み取れない場合は null）
 
 【出力形式】JSONのみ、説明文は一切なし:
-{{"available_dates": ["YYYY-MM-DD", "YYYY-MM-DD", ...]}}"""
+{{"available_dates": ["YYYY-MM-DD", "YYYY-MM-DD", ...], "visible_range": {{"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}}}}"""
 
-def parse_json_response(text):
+def parse_extraction_response(text):
+    """available_dates と visible_range を返す"""
     m = re.search(r'\{.*\}', text, re.DOTALL)
     if not m:
-        return []
+        return [], None
     try:
         data = json.loads(m.group(0))
-        return data.get("available_dates", [])
+        dates = data.get("available_dates", [])
+        vr = data.get("visible_range")
+        return dates, vr
     except json.JSONDecodeError:
-        return []
+        return [], None
+
+def parse_json_response(text):
+    """旧APIとの互換のため、available_dates だけを返すバージョン"""
+    dates, _ = parse_extraction_response(text)
+    return dates
 
 def extract_with_gemini(image_bytes, mime_type, event):
+    """戻り値: (available_dates, visible_range)"""
     from google import genai
     from google.genai import types
     import time
@@ -125,7 +135,6 @@ def extract_with_gemini(image_bytes, mime_type, event):
     config = types.GenerateContentConfig(response_mime_type="application/json")
     contents = [image_part, build_extraction_prompt(event)]
 
-    # 混雑時の対策：複数モデル × リトライ
     models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]
     last_err = None
     for model in models_to_try:
@@ -134,18 +143,18 @@ def extract_with_gemini(image_bytes, mime_type, event):
                 response = client.models.generate_content(
                     model=model, contents=contents, config=config
                 )
-                return parse_json_response(response.text)
+                return parse_extraction_response(response.text)
             except Exception as e:
                 msg = str(e)
                 last_err = e
-                # 503/429 はリトライ、それ以外はモデル切替
                 if "503" in msg or "429" in msg or "UNAVAILABLE" in msg or "RESOURCE_EXHAUSTED" in msg:
-                    time.sleep(2 ** attempt)  # 1, 2, 4秒
+                    time.sleep(2 ** attempt)
                     continue
-                break  # 他のエラーは即座にモデル切替
+                break
     raise last_err
 
 def extract_with_claude(image_bytes, mime_type, event):
+    """戻り値: (available_dates, visible_range)"""
     from anthropic import Anthropic
     client = Anthropic(api_key=get_anthropic_key())
     img_b64 = base64.standard_b64encode(image_bytes).decode("ascii")
@@ -160,17 +169,17 @@ def extract_with_claude(image_bytes, mime_type, event):
             ]
         }]
     )
-    return parse_json_response(response.content[0].text)
+    return parse_extraction_response(response.content[0].text)
 
 def extract_available_dates(image_bytes, mime_type, event):
-    """空き日付のリストを返す。第2戻り値はモックフラグ"""
-    # 優先順：Gemini（無料枠あり）→ Claude → モック
+    """戻り値: (available_dates, is_mock, visible_range)"""
     if get_gemini_key():
         try:
-            return extract_with_gemini(image_bytes, mime_type, event), False
+            dates, vr = extract_with_gemini(image_bytes, mime_type, event)
+            return dates, False, vr
         except ImportError:
             st.warning("google-genai ライブラリが未インストールです。pip install google-genai を実行してください")
-            return mock_extract(event), True
+            return mock_extract(event), True, None
         except Exception as e:
             msg = str(e)
             if "503" in msg or "UNAVAILABLE" in msg:
@@ -179,18 +188,19 @@ def extract_available_dates(image_bytes, mime_type, event):
                 st.error("Gemini の無料枠の利用上限に達しました（1分15回・1日1500回）。少し時間をおいてからもう一度お試しください")
             else:
                 st.error(f"Gemini API エラー: {msg}")
-            return [], False
+            return [], False, None
 
     if get_anthropic_key():
         try:
-            return extract_with_claude(image_bytes, mime_type, event), False
+            dates, vr = extract_with_claude(image_bytes, mime_type, event)
+            return dates, False, vr
         except ImportError:
-            return mock_extract(event), True
+            return mock_extract(event), True, None
         except Exception as e:
             st.error(f"Claude API エラー: {e}")
-            return [], False
+            return [], False, None
 
-    return mock_extract(event), True
+    return mock_extract(event), True, None
 
 def mock_extract(event):
     """API キー未設定時の模擬データ：候補期間中の土日を返す"""
@@ -277,6 +287,17 @@ def show_create_event():
             if duration_h == 0 and duration_m == 0:
                 st.error("所要時間を1分以上に設定してください")
                 return
+            # 時間帯と所要時間の整合性チェック
+            sh, sm = map(int, start_time.split(':'))
+            eh, em = map(int, end_time.split(':'))
+            range_min = (eh * 60 + em) - (sh * 60 + sm)
+            dur_min = duration_h * 60 + duration_m
+            if range_min <= 0:
+                st.error("時間帯の終了時刻は開始時刻より後にしてください")
+                return
+            if dur_min > range_min:
+                st.error(f"所要時間（{duration_h}時間{duration_m:02d}分）が時間帯の長さ（{range_min//60}時間{range_min%60:02d}分）より長くなっています。設定を見直してください")
+                return
 
             event_id = gen_id(8)
             admin_token = gen_id(12)
@@ -359,18 +380,85 @@ def show_participant(event_id):
         participant_step3()
 
 def participant_step1(event_id, event):
-    st.markdown("### 1. お名前")
-    name = st.text_input("お名前", placeholder="例：つる", label_visibility="collapsed", key="input_pname")
-
-    st.markdown("### 2. カレンダーのスクショを送る")
     d_from = datetime.strptime(event['date_from'], '%Y-%m-%d').date()
     d_to = datetime.strptime(event['date_to'], '%Y-%m-%d').date()
-    st.caption(
-        f"候補期間（{d_from.strftime('%Y年%m月%d日')} 〜 {d_to.strftime('%Y年%m月%d日')}）が映っているスクショを送ってください。"
-        f"\n\n📌 **週間表示** が読み取り精度高くておすすめです。"
-        f"\n📌 複数枚OK／ドラッグ＆ドロップ可／クリップボードからコピペ可"
-        f"\n📌 Google・Apple・Outlook・手帳の写真、なんでもOK"
-    )
+
+    # === プライバシー注意書き（最上部）===
+    with st.container(border=True):
+        st.markdown("#### 🔒 プライバシーについて（必ずお読みください）")
+        st.markdown("""
+- アップロードした画像は **AIが日付を読み取った直後に破棄** され、サーバーには保存されません
+- **主催者にも画像は届きません**。送られるのは「日付・時間枠の文字情報」だけです
+- 念のため、**予定の中身が見られたくない場合** は、カレンダーアプリの「予定の詳細を非表示」モードに切り替えてからスクショするのがおすすめです
+""")
+
+    st.markdown("### 1. お名前")
+    name = st.text_input("お名前", placeholder="例：田中太郎", label_visibility="collapsed", key="input_pname")
+
+    # === 参加可能時間設定（オプション）===
+    st.markdown("### 2. 参加可能な時間（オプション）")
+    st.caption("特に設定しなくてもOK。「平日は19時以降だけ」「土曜は午後だけ」など細かく指定したい場合に使ってください")
+
+    time_options = [f"{h:02d}:{m:02d}" for h in range(24) for m in [0, 30]]
+    default_start_idx = time_options.index(event['start_time'])
+    default_end_idx = time_options.index(event['end_time'])
+
+    with st.expander("⏰ 平日／土日の時間帯を設定する", expanded=False):
+        st.markdown("**平日（月〜金）の参加可能時間**")
+        c1, c2 = st.columns(2)
+        with c1:
+            wd_start = st.selectbox("平日 開始", time_options, index=default_start_idx, key="wd_start", label_visibility="collapsed")
+        with c2:
+            wd_end = st.selectbox("平日 終了", time_options, index=default_end_idx, key="wd_end", label_visibility="collapsed")
+
+        st.markdown("**土日の参加可能時間**")
+        c3, c4 = st.columns(2)
+        with c3:
+            we_start = st.selectbox("土日 開始", time_options, index=default_start_idx, key="we_start", label_visibility="collapsed")
+        with c4:
+            we_end = st.selectbox("土日 終了", time_options, index=default_end_idx, key="we_end", label_visibility="collapsed")
+
+    with st.expander("❌ 「この時間は絶対NG」を追加する", expanded=False):
+        st.caption("仕事の固定予定など、カレンダーに入れていなくても除外したい時間帯を追加できます")
+        if "exclusions" not in st.session_state:
+            st.session_state.exclusions = []
+
+        for i, exc in enumerate(st.session_state.exclusions):
+            cols = st.columns([2, 2, 1, 2, 1])
+            with cols[0]:
+                exc['day_type'] = st.selectbox("曜日", ["平日", "土日", "毎日"],
+                                                index=["平日", "土日", "毎日"].index(exc.get('day_type', '平日')),
+                                                key=f"exc_dt_{i}", label_visibility="collapsed")
+            with cols[1]:
+                exc['start'] = st.selectbox("開始", time_options,
+                                             index=time_options.index(exc.get('start', '12:00')),
+                                             key=f"exc_st_{i}", label_visibility="collapsed")
+            with cols[2]:
+                st.markdown("<div style='padding-top:8px;text-align:center'>〜</div>", unsafe_allow_html=True)
+            with cols[3]:
+                exc['end'] = st.selectbox("終了", time_options,
+                                           index=time_options.index(exc.get('end', '13:00')),
+                                           key=f"exc_en_{i}", label_visibility="collapsed")
+            with cols[4]:
+                if st.button("🗑", key=f"exc_del_{i}"):
+                    st.session_state.exclusions.pop(i)
+                    st.rerun()
+
+        if st.button("+ 除外時間帯を追加"):
+            st.session_state.exclusions.append({"day_type": "平日", "start": "12:00", "end": "13:00"})
+            st.rerun()
+
+    # === スクショ撮影のコツ ===
+    st.markdown("### 3. カレンダーのスクショを送る")
+    with st.container(border=True):
+        st.markdown("##### 📸 スクショを撮るときのコツ")
+        st.markdown(f"""
+- **候補期間（{d_from.strftime('%Y年%m月%d日')}〜{d_to.strftime('%Y年%m月%d日')}）が全部映る** ように撮る
+- **日付の数字** がはっきり見えるか確認（小さすぎるとAIが読めません）
+- **時間軸** が見える表示（週間表示／日表示）がおすすめ。月表示だと時間が分からないので精度が下がります
+- 期間が長い場合は **複数枚に分けて** 撮影してOK
+- Google・Apple・Outlook・手帳の写真、何でもOK
+""")
 
     uploaded_files = st.file_uploader(
         "画像をアップロード",
@@ -380,8 +468,7 @@ def participant_step1(event_id, event):
         key="input_files",
     )
 
-    # クリップボードから貼り付け
-    st.caption("または ↓ クリップボードから貼り付け（スクショを撮った直後に使えます）")
+    st.caption("または ↓ クリップボードから貼り付け（スクショ直後に使えます）")
     pasted_images = st.session_state.get("pasted_images", [])
     try:
         from streamlit_paste_button import paste_image_button as pbutton
@@ -406,11 +493,6 @@ def participant_step1(event_id, event):
     n_pasted = len(pasted_images)
     n_images = n_uploaded + n_pasted
 
-    st.markdown(
-        '<div class="privacy-note">🔒 <b>プライバシー</b>：画像はAIが日付を読み取った後すぐ破棄され、保存されません。主催者にも画像は届きません（日付の文字情報だけが届きます）</div>',
-        unsafe_allow_html=True,
-    )
-
     if n_images > 0 and name:
         st.success(f"✅ 名前OK / 画像 {n_images}枚 セット完了。下のボタンで読み取り開始")
     elif not name and n_images > 0:
@@ -419,7 +501,6 @@ def participant_step1(event_id, event):
         st.warning("カレンダーの画像を送ってください（アップロードまたは貼り付け）")
 
     if st.button("AIで読み取る", type="primary", use_container_width=True, disabled=(not name or n_images == 0)):
-        # 全画像のバイト列を集める
         import io
         all_images = []
         for f in (uploaded_files or []):
@@ -429,29 +510,29 @@ def participant_step1(event_id, event):
             img.save(buf, format="PNG")
             all_images.append((buf.getvalue(), "image/png"))
 
-        # サイズチェック
         for img_bytes, _ in all_images:
             if len(img_bytes) > MAX_IMAGE_SIZE_MB * 1024 * 1024:
                 st.error(f"画像サイズが大きすぎます（1枚あたり {MAX_IMAGE_SIZE_MB}MB以下にしてください）")
                 return
 
-        # 全画像を順に処理して結果を統合
         all_dates = set()
+        visible_ranges = []
         is_mock_any = False
         progress = st.progress(0, text="AIが読み取り中...")
         for i, (img_bytes, mime) in enumerate(all_images):
             progress.progress((i) / max(1, n_images), text=f"AIが読み取り中... ({i+1}/{n_images}枚目)")
             try:
-                dates, is_mock = extract_available_dates(img_bytes, mime, event)
+                dates, is_mock, vr = extract_available_dates(img_bytes, mime, event)
                 all_dates.update(dates)
                 if is_mock:
                     is_mock_any = True
+                if vr and vr.get('from') and vr.get('to'):
+                    visible_ranges.append(vr)
             except Exception as e:
                 st.error(f"{i+1}枚目の読み取りでエラー: {e}")
                 return
         progress.progress(1.0, text="完了！")
 
-        # 候補期間でフィルタ
         valid = []
         for d_str in all_dates:
             try:
@@ -465,24 +546,59 @@ def participant_step1(event_id, event):
         st.session_state.participant_name = name
         st.session_state.p_dates = valid
         st.session_state.p_is_mock = is_mock_any
-        st.session_state.p_selected = set(valid)
+        st.session_state.p_visible_ranges = visible_ranges
+        # 参加可能時間設定を保存
+        st.session_state.p_settings = {
+            "weekday_start": wd_start,
+            "weekday_end": wd_end,
+            "weekend_start": we_start,
+            "weekend_end": we_end,
+            "exclusions": list(st.session_state.get("exclusions", [])),
+        }
         st.session_state.p_step = 2
         st.session_state.pasted_images = []
         st.rerun()
 
 def participant_step2(event_id, event):
-    st.markdown("### 3. 参加できる日にチェック")
-    st.caption("AIが候補期間の予定を読み取りました。下の日付のうち、**参加できる日だけ**にチェックを入れてください")
+    st.markdown("### 4. 参加できる日時にチェック")
+    st.caption("AIが候補期間の予定を読み取りました。下の日時のうち、**参加できる枠だけ** にチェックを残してください")
 
     if st.session_state.get("p_is_mock"):
         st.warning("⚠️ 開発モード：API キーが未設定のため、模擬データを表示しています（実際のスクショ内容は読み取られていません）")
 
+    # === スクショカバレッジ不足チェック ===
+    d_from = datetime.strptime(event['date_from'], '%Y-%m-%d').date()
+    d_to = datetime.strptime(event['date_to'], '%Y-%m-%d').date()
+    visible_ranges = st.session_state.get("p_visible_ranges", [])
+    if visible_ranges:
+        try:
+            min_visible = min(datetime.strptime(vr['from'], '%Y-%m-%d').date() for vr in visible_ranges)
+            max_visible = max(datetime.strptime(vr['to'], '%Y-%m-%d').date() for vr in visible_ranges)
+            missing_before = (min_visible - d_from).days if min_visible > d_from else 0
+            missing_after = (d_to - max_visible).days if max_visible < d_to else 0
+            if missing_before > 0 or missing_after > 0:
+                msg_parts = []
+                if missing_before > 0:
+                    msg_parts.append(f"**{d_from.strftime('%m/%d')}〜{(min_visible - timedelta(days=1)).strftime('%m/%d')}**（{missing_before}日分）")
+                if missing_after > 0:
+                    msg_parts.append(f"**{(max_visible + timedelta(days=1)).strftime('%m/%d')}〜{d_to.strftime('%m/%d')}**（{missing_after}日分）")
+                st.warning(f"⚠️ アップロードされたスクショには {' と '.join(msg_parts)} が映っていない可能性があります。前のステップに戻ってスクショを追加することをおすすめします")
+                if st.button("← 前のステップに戻る"):
+                    for k in list(st.session_state.keys()):
+                        if k.startswith("p_") or k.startswith("slot_") or k.startswith("date_"):
+                            del st.session_state[k]
+                    st.session_state.p_step = 1
+                    st.rerun()
+        except (KeyError, ValueError):
+            pass
+
     n = len(st.session_state.p_dates)
     if n == 0:
-        st.error("候補期間内に空き日が見つかりませんでした")
-        if st.button("やり直す"):
-            for k in ["p_step", "p_dates", "p_selected"]:
-                st.session_state.pop(k, None)
+        st.error("候補期間内に空き日が見つかりませんでした。スクショを撮り直してみてください")
+        if st.button("← やり直す"):
+            for k in list(st.session_state.keys()):
+                if k.startswith("p_") or k.startswith("slot_") or k.startswith("date_"):
+                    del st.session_state[k]
             st.rerun()
         return
 
@@ -492,23 +608,78 @@ def participant_step2(event_id, event):
         event['duration_hours'], event['duration_minutes']
     )
     if not slots:
-        st.error("時間帯と所要時間の設定に問題があります（イベント作成者にご連絡ください）")
+        st.error(
+            "このイベントは「時間帯」より「所要時間」が長く設定されているため、空き枠を作れません。\n\n"
+            f"- 時間帯: {event['start_time']} 〜 {event['end_time']}\n"
+            f"- 所要時間: {event['duration_hours']}時間{event['duration_minutes']:02d}分\n\n"
+            "イベント作成者に設定の見直しを依頼してください"
+        )
         return
 
-    n_slots_per_date = len(slots)
-    st.success(f"✅ AI読み取り完了：**{n}日** に空きあり（1日あたり {n_slots_per_date} 枠）")
+    # === 参加者設定によるスロットフィルタ ===
+    settings = st.session_state.get("p_settings", {})
+    filtered_dates = []
+    filtered_slots_by_date = {}
+    for d_str in st.session_state.p_dates:
+        d = datetime.strptime(d_str, '%Y-%m-%d').date()
+        is_weekend = d.weekday() in [5, 6]
+        # 曜日タイプによる時間窓
+        if is_weekend:
+            win_s = settings.get("weekend_start", event['start_time'])
+            win_e = settings.get("weekend_end", event['end_time'])
+        else:
+            win_s = settings.get("weekday_start", event['start_time'])
+            win_e = settings.get("weekday_end", event['end_time'])
+
+        valid_slots = []
+        for s_st, s_en in slots:
+            # 時間窓に収まっているか
+            if s_st < win_s or s_en > win_e:
+                continue
+            # 除外時間帯と被っているか
+            excluded = False
+            for exc in settings.get("exclusions", []):
+                dt = exc.get('day_type', '毎日')
+                if dt == '平日' and is_weekend:
+                    continue
+                if dt == '土日' and not is_weekend:
+                    continue
+                # 重なり判定
+                if s_st < exc['end'] and s_en > exc['start']:
+                    excluded = True
+                    break
+            if excluded:
+                continue
+            valid_slots.append((s_st, s_en))
+
+        if valid_slots:
+            filtered_dates.append(d_str)
+            filtered_slots_by_date[d_str] = valid_slots
+
+    n_filtered = len(filtered_dates)
+    if n_filtered == 0:
+        st.error("参加可能時間／除外設定で全ての枠が除外されました。設定を見直してください")
+        if st.button("← 前のステップに戻る"):
+            for k in list(st.session_state.keys()):
+                if k.startswith("p_") or k.startswith("slot_"):
+                    del st.session_state[k]
+            st.session_state.p_step = 1
+            st.rerun()
+        return
+
+    st.success(f"✅ AI読み取り完了：**{n_filtered}日** に空きあり")
 
     # 初期化：p_selected_slots に "YYYY-MM-DD|HH:MM-HH:MM" 形式で保持
     if "p_selected_slots" not in st.session_state:
         initial = set()
-        for d_str in st.session_state.p_dates:
-            for s_st, s_en in slots:
+        for d_str, valid_slots in filtered_slots_by_date.items():
+            for s_st, s_en in valid_slots:
                 initial.add(f"{d_str}|{s_st}-{s_en}")
         st.session_state.p_selected_slots = initial
 
     # 月ごとにグループ化
     by_month = defaultdict(list)
-    for d_str in st.session_state.p_dates:
+    for d_str in filtered_dates:
         d = datetime.strptime(d_str, '%Y-%m-%d').date()
         by_month[(d.year, d.month)].append(d)
 
@@ -518,7 +689,7 @@ def participant_step2(event_id, event):
             for d in dates:
                 d_str = d.isoformat()
                 st.markdown(f"📅 **{d.month}月{d.day}日（{WEEKDAY_JP[d.weekday()]}）**")
-                for s_st, s_en in slots:
+                for s_st, s_en in filtered_slots_by_date[d_str]:
                     slot_id = f"{d_str}|{s_st}-{s_en}"
                     key = f"slot_{slot_id}"
                     if key not in st.session_state:
@@ -531,7 +702,7 @@ def participant_step2(event_id, event):
                         st.session_state.p_selected_slots.add(slot_id)
                     else:
                         st.session_state.p_selected_slots.discard(slot_id)
-                st.write("")  # 日付間のスペース
+                st.write("")
 
     st.info("💡 予定を入れたくない日程があればチェックを外してください")
 
